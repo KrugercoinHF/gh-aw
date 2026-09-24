@@ -831,10 +831,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
               text: JSON.stringify({
                 result: "error",
                 error: checkoutResult.error,
-                details:
-                  `Repository '${repoSlug}' was not found as a git checkout in the workspace. ` +
-                  `For multi-repo workflows, use actions/checkout with a 'path' parameter to checkout ` +
-                  `each repo to a subdirectory (e.g., 'repos/repo-a/').`,
+                details: checkoutResult.error,
               }),
             },
           ],
@@ -1278,7 +1275,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
               type: "text",
               text: JSON.stringify({
                 result: "error",
-                error: `Repository '${itemRepo}' not found in workspace. Check out the target repo with actions/checkout and set its 'path' input so the checkout can be located. If checking out multiple repositories, ensure each actions/checkout step uses the appropriate 'path' input.`,
+                error: checkoutResult.error,
               }),
             },
           ],
@@ -2944,7 +2941,16 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     return defaultHandler("update_issue")(args || {});
   };
 
-  const jiraCreateIssueHandler = defaultHandler("jira_create_issue");
+  const jiraCreateIssueHandler = args => {
+    const temporaryId = `#${generateTemporaryId()}`;
+    const entry = { ...(args || {}), type: "jira_create_issue", temporary_id: temporaryId };
+    appendSafeOutputCounted(entry);
+    const output = { result: "success", temporary_id: temporaryId };
+    return {
+      content: [{ type: "text", text: JSON.stringify(output) }],
+      structuredContent: output,
+    };
+  };
   const jiraAddCommentHandler = defaultHandler("jira_add_comment");
   const jiraAddLabelHandler = defaultHandler("jira_add_label");
   const jiraUpdateIssueHandler = args => {

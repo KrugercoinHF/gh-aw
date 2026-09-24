@@ -459,18 +459,33 @@ List workflows with basic information (name, engine, compilation status) without
 gh aw list                                  # List all workflows
 gh aw list ci-                              # Filter by pattern (case-insensitive)
 gh aw list --json                           # Output in JSON format
+gh aw list --stale                          # List workflows with stale or missing lock files
 gh aw list --label automation               # Filter by label
 gh aw list --dir custom/workflows           # List from a local custom directory
 gh aw list --repo owner/repo --path .github/workflows  # List from a remote repository
 ```
 
-**Options:** `--json/-j`, `--label`, `--dir/-d`, `--path`, `--repo/-r`
+**Options:** `--json/-j`, `--label`, `--stale`, `--dir/-d`, `--path`, `--repo/-r`
 
 Two flags control the workflow directory location, with different purposes:
 - `--dir` (`-d`): overrides the **local** workflow directory. Applies only when `--repo` is not set.
 - `--path`: specifies the workflow directory path in a **remote** repository. Use together with `--repo`.
 
 Fast enumeration without GitHub API queries. For detailed status including enabled/disabled state and run information, use `status` instead.
+
+For local workflows, `compiled` is `Yes` when the source frontmatter matches the generated `.lock.yml`, `No` when the hashes differ, and `N/A` when the lock file is missing. JSON output is a top-level array with one object per workflow and the same values in each object's `compiled` field. Use `--stale` to inspect only stale or missing lock files:
+
+```bash
+gh aw list --stale
+```
+
+For CI, fail when any lock file is stale or missing:
+
+```bash
+gh aw list --json | jq -e 'all(.[]; .compiled == "Yes")'
+```
+
+Run the check from the repository root. If it reports workflows, run `gh aw compile <workflow-id>` for each one and commit the regenerated `.lock.yml` files with their sources.
 
 #### `status`
 
@@ -539,7 +554,7 @@ gh aw logs my-workflow --train -c 50  # Train on up to 50 runs of a specific wor
 cat run-ids.txt | gh aw logs --stdin
 echo "1234567890" | gh aw logs --stdin --engine claude
 cat run-ids.txt | gh aw logs --stdin --repo owner/repo   # required for bare numeric IDs
-gh aw logs --runtime gvisor                              # Filter to runs using a specific sandbox agent runtime
+gh aw logs --runtime cloud-hypervisor                    # Filter to runs using a specific sandbox agent runtime
 ```
 
 **Options:** `--after-run-id`, `--artifacts`, `--before-run-id`, `--cache-before`, `--cached-jsonl`, `--count/-c`, `--end-date`, `--engine/-e`, `--evals`, `--exclude-staged`, `--filtered-integrity`, `--firewall`, `--format`, `--json/-j`, `--last`, `--no-firewall`, `--output/-o`, `--parse`, `--ref`, `--report-file`, `--repo/-r`, `--runtime`, `--safe-output`, `--start-date`, `--stdin`, `--summary-file`, `--timeout`, `--tool-graph`, `--train`
@@ -576,7 +591,7 @@ gh aw audit 12345678 --repo owner/repo                    # Specify repository f
 echo "1234567890" | gh aw audit --stdin
 echo -e "1234567890\n9876543210" | gh aw audit --stdin   # diff mode: first is base
 cat run-ids.txt | gh aw audit --stdin --repo owner/repo
-gh aw audit 1234567890 --runtime gvisor                  # Skip run unless sandbox agent runtime matches
+gh aw audit 1234567890 --runtime cloud-hypervisor        # Skip run unless sandbox agent runtime matches
 ```
 
 **Options:** `--artifacts`, `--evals`, `--experiment`, `--format`, `--json/-j`, `--output/-o`, `--parse`, `--repo/-r`, `--runtime`, `--stdin`, `--variant`

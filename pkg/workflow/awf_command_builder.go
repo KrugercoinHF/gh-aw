@@ -93,6 +93,10 @@ func buildExpandableAWFArgs(config AWFCommandConfig, isCloudHypervisor, isArcDin
 		expandableArgs += fmt.Sprintf(` --mount "%s:%s:ro" --mount "%s:/host%s:ro"`, ghAwDir, ghAwDir, ghAwDir, ghAwDir)
 	}
 	expandableArgs, arcDindDockerHostProbe = appendArcDindMountSettings(expandableArgs, arcDindDockerHostProbe, isArcDind)
+	if usesArcDindDetectionMount(config.WorkflowData) {
+		detectionDir := rewriteArcDindPath(constants.ThreatDetectionDir)
+		expandableArgs += fmt.Sprintf(` --mount "%s:%s:rw"`, detectionDir, detectionDir)
+	}
 	if !isCloudHypervisor && config.WorkflowData != nil && usesSafeOutputsArtifactStaging(config.WorkflowData.SafeOutputs) {
 		stagingDir := SafeOutputsUploadArtifactsDir
 		expandableArgs += fmt.Sprintf(` --mount "%s:%s:rw"`, stagingDir, stagingDir)
@@ -249,9 +253,9 @@ func buildCloudHypervisorFilesystemMkdirScript(workflowData *WorkflowData) strin
 		return ""
 	}
 	sort.Strings(targets)
-	quoted := make([]string, len(targets))
-	for i, target := range targets {
-		quoted[i] = shellEscapeArgWithVarsPreserved(target, "GITHUB_WORKSPACE")
+	quoted := make([]string, 0, len(targets))
+	for _, target := range targets {
+		quoted = append(quoted, shellEscapeArgWithVarsPreserved(target, "GITHUB_WORKSPACE"))
 	}
 	return "mkdir -p " + strings.Join(quoted, " ")
 }
@@ -444,14 +448,8 @@ func BuildAWFArgs(config AWFCommandConfig) []string {
 
 func appendTTYAndContainerRuntimeArgs(config AWFCommandConfig, firewallConfig *FirewallConfig) []string {
 	var awfArgs []string
-	if config.UsesTTY && !isDockerSbxRuntime(config.WorkflowData) && !isCloudHypervisorRuntime(config.WorkflowData) {
+	if config.UsesTTY && !isCloudHypervisorRuntime(config.WorkflowData) {
 		awfArgs = append(awfArgs, "--tty")
-	}
-	if isDockerSbxRuntime(config.WorkflowData) && awfSupportsContainerRuntime(firewallConfig) {
-		awfArgs = append(awfArgs, "--container-runtime", "sbx")
-		awfHelpersLog.Print("Added --container-runtime sbx for docker-sbx microVM runtime")
-	} else if isDockerSbxRuntime(config.WorkflowData) {
-		awfHelpersLog.Printf("Skipping --container-runtime sbx: AWF version %q is older than required minimum %s", getAWFImageTag(firewallConfig), constants.AWFContainerRuntimeMinVersion)
 	}
 	if isCloudHypervisorRuntime(config.WorkflowData) && awfSupportsCloudHypervisor(firewallConfig) {
 		awfArgs = append(awfArgs, "--container-runtime", "cloud-hypervisor", "--cloud-hypervisor-preview", "--cloud-hypervisor-vcpus", strconv.Itoa(constants.DefaultCloudHypervisorVCPUs), "--cloud-hypervisor-memory-mib", strconv.Itoa(constants.DefaultCloudHypervisorMemoryMiB))
@@ -488,6 +486,9 @@ func appendCustomMountArgs(workflowData *WorkflowData, agentConfig *AgentSandbox
 	copy(sortedMounts, agentConfig.Mounts)
 	sort.Strings(sortedMounts)
 	for _, mount := range sortedMounts {
+		if usesArcDindDetectionMount(workflowData) && mount == threatDetectionRWMount {
+			continue // Emitted with shell expansion by buildExpandableAWFArgs.
+		}
 		awfArgs = append(awfArgs, "--mount", mount)
 	}
 	awfHelpersLog.Printf("Added %d custom mounts from agent config", len(sortedMounts))
@@ -638,9 +639,9 @@ func getMCPGatewayPort(workflowData *WorkflowData) int {
 }
 
 func joinPorts(ports []int) string {
-	parts := make([]string, len(ports))
-	for i, port := range ports {
-		parts[i] = strconv.Itoa(port)
+	parts := make([]string, 0, len(ports))
+	for _, port := range ports {
+		parts = append(parts, strconv.Itoa(port))
 	}
 	return strings.Join(parts, ",")
 }

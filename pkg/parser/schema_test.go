@@ -1288,6 +1288,23 @@ func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_MaxDailyAICreditsN
 	}
 }
 
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_MaxDailyAICreditsRepoMemoryBackendAllowed(t *testing.T) {
+	t.Parallel()
+
+	validFrontmatter := map[string]any{
+		"on": "push",
+		"max-daily-ai-credits": map[string]any{
+			"value":   1000,
+			"backend": "repo-memory",
+		},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(validFrontmatter, "/tmp/gh-aw/max-daily-ai-credits-repo-memory-backend-test.md")
+	if err != nil {
+		t.Fatalf("expected max-daily-ai-credits backend=repo-memory to pass schema validation, got: %v", err)
+	}
+}
+
 func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_SandboxAgentPlatform(t *testing.T) {
 	t.Parallel()
 
@@ -1832,21 +1849,52 @@ func TestMainWorkflowSchema_BodyFootersAllowed(t *testing.T) {
 	}
 }
 
-func TestMainWorkflowSchema_GitHubTokenAllowsStepOutputs(t *testing.T) {
+func TestMainWorkflowSchema_GitHubTokenAllowsStepOutputsWithSecretFallbacks(t *testing.T) {
 	t.Parallel()
 
-	frontmatter := map[string]any{
-		"on": "daily",
-		"safe-outputs": map[string]any{
-			"github-token": "${{ steps.fetch-token.outputs.my-token }}",
-			"create-issue": map[string]any{
-				"github-token": "${{ steps.fetch-token.outputs.my-token }}",
-			},
-		},
-	}
+	for _, token := range []string{
+		"${{ steps.fetch-token.outputs.my-token }}",
+		"${{ steps.fetch-token.outputs.my-token || secrets.CUSTOM_PAT }}",
+		"${{ steps.fetch-token.outputs.my-token || secrets.CUSTOM_PAT || secrets.GITHUB_TOKEN }}",
+	} {
+		t.Run(token, func(t *testing.T) {
+			frontmatter := map[string]any{
+				"on": "daily",
+				"safe-outputs": map[string]any{
+					"github-token": token,
+					"create-issue": map[string]any{
+						"github-token": token,
+					},
+				},
+			}
 
-	if err := validateWithSchema(frontmatter, mainWorkflowSchema, "main workflow file"); err != nil {
-		t.Fatalf("expected steps.*.outputs.* github-token expression to pass schema validation, got: %v", err)
+			if err := validateWithSchema(frontmatter, mainWorkflowSchema, "main workflow file"); err != nil {
+				t.Fatalf("expected steps.*.outputs.* github-token expression to pass schema validation, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestMainWorkflowSchema_GitHubTokenRejectsUnsupportedStepOutputFallbacks(t *testing.T) {
+	t.Parallel()
+
+	for _, token := range []string{
+		"${{ steps.fetch-token.outputs.my-token || env.GITHUB_TOKEN }}",
+		"${{ steps.fetch-token.outputs.my-token || needs.auth.outputs.token }}",
+		"${{ steps.fetch-token.outputs.my-token || 'plaintext' }}",
+	} {
+		t.Run(token, func(t *testing.T) {
+			frontmatter := map[string]any{
+				"on": "daily",
+				"safe-outputs": map[string]any{
+					"github-token": token,
+				},
+			}
+
+			if err := validateWithSchema(frontmatter, mainWorkflowSchema, "main workflow file"); err == nil {
+				t.Fatal("expected unsupported steps.*.outputs.* github-token fallback to fail schema validation")
+			}
+		})
 	}
 }
 
@@ -2895,7 +2943,7 @@ func TestMainWorkflowSchema_SandboxAgentRuntime(t *testing.T) {
 		}
 	}
 
-	for _, runtime := range []string{"docker", "docker-sudo-iptables", "gvisor", "docker-sbx", "cloud-hypervisor"} {
+	for _, runtime := range []string{"docker", "docker-sudo-iptables", "cloud-hypervisor"} {
 		t.Run("runtime: "+runtime+" is accepted", func(t *testing.T) {
 			t.Parallel()
 
@@ -2907,15 +2955,17 @@ func TestMainWorkflowSchema_SandboxAgentRuntime(t *testing.T) {
 		})
 	}
 
-	t.Run("unknown runtime is rejected", func(t *testing.T) {
-		t.Parallel()
+	for _, runtime := range []string{"podman", "gvisor", "docker-sbx"} {
+		t.Run("runtime: "+runtime+" is rejected", func(t *testing.T) {
+			t.Parallel()
 
-		frontmatter := agentFrontmatter(map[string]any{"id": "awf", "runtime": "podman"})
-		err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/sandbox-agent-runtime-unknown-test.md")
-		if err == nil {
-			t.Error("expected an unsupported sandbox.agent.runtime to be rejected by schema validation")
-		}
-	})
+			frontmatter := agentFrontmatter(map[string]any{"id": "awf", "runtime": runtime})
+			err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/sandbox-agent-runtime-unknown-"+runtime+"-test.md")
+			if err == nil {
+				t.Errorf("expected sandbox.agent.runtime: %s to be rejected by schema validation", runtime)
+			}
+		})
+	}
 
 	for _, removed := range []struct {
 		name  string

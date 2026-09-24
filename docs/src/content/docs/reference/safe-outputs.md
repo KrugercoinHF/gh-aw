@@ -129,7 +129,7 @@ Linear Safe Outputs use Linear's public GraphQL API from the isolated `safe_outp
 safe-outputs:
   linear-token: ${{ secrets.LINEAR_API_KEY }}
   linear-create-issue:
-    team-id: ${{ vars.LINEAR_TEAM_ID }}
+    team-id: "ENG"
     project-id: "810f57a7e383"
     max: 1
   linear-add-comment:
@@ -140,7 +140,7 @@ safe-outputs:
     body: true
 ```
 
-`team-id` accepts a Linear team model UUID, available through Linear's model UUID tooling or API, or a GitHub Actions expression such as `${{ vars.LINEAR_TEAM_ID }}`. Optional `project-id` fixes new issues to a trusted project and accepts either the 12-character identifier from a Linear project URL or its model UUID. When omitted, the compiler loads `LINEAR_TEAM_ID` and `LINEAR_PROJECT_ID` from same-named repository or organization variables. Values in `safe-outputs.env` can override those defaults; explicit `team-id` and `project-id` values take precedence over environment fallbacks. Comment and update targets are fixed trusted configuration and accept either a Linear issue model UUID or shorthand identifier such as `ENG-123`. Updates replace only the enabled `title` and `body` fields. All agent-provided titles, descriptions, and comments use standard Safe Outputs sanitization.
+`team-id` accepts a Linear team model UUID, team key such as `ENG`, team name, or a GitHub Actions expression such as `${{ secrets.LINEAR_TEAM_ID }}`. UUIDs are passed directly to Linear; keys and names are resolved through the Linear API, with key matches taking precedence. Optional `project-id` fixes new issues to a trusted project and accepts either the 12-character identifier from a Linear project URL or its model UUID. When omitted, the compiler loads `LINEAR_TEAM_ID` from a repository or organization secret and `LINEAR_PROJECT_ID` from a same-named variable. Values in `safe-outputs.env` can override those defaults; explicit `team-id` and `project-id` values take precedence over environment fallbacks. Comment and update targets are fixed trusted configuration and accept either a Linear issue model UUID or shorthand identifier such as `ENG-123`. Updates replace only the enabled `title` and `body` fields. All agent-provided titles, descriptions, and comments use standard Safe Outputs sanitization.
 
 ### System Types (Auto-Enabled)
 
@@ -200,10 +200,12 @@ Each output accepts `max` and `staged`. In staged mode, the handler writes a Jir
 
 Descriptions and comment bodies remain plain strings at the agent boundary. The runtime converts them deterministically to Atlassian Document Format version 1, preserving paragraphs and line breaks. `jira_add_label` uses Jira's additive field-update operation and does not replace existing labels.
 
+`jira_create_issue` returns a temporary `#aw_` ID. Pass that ID as `issue_key` to update, comment on, or label the newly created Jira issue later in the same run.
+
 > [!IMPORTANT]
 > Unprefixed tools such as `create_issue`, `update_issue`, `add_comment`, and `add_labels` operate on GitHub. Jira operations always use the `jira_` prefix.
 
-This initial integration does not support transitions, assignment, custom fields, priorities, components, attachments, issue links, subtasks, label removal, JQL, bulk operations, arbitrary Jira REST calls, or OAuth installation flows. Update, comment, and label operations require a known Jira issue key; they cannot reference a Jira issue created earlier in the same run.
+This integration does not support transitions, assignment, custom fields, priorities, components, attachments, issue links, subtasks, label removal, JQL, bulk operations, arbitrary Jira REST calls, or OAuth installation flows.
 
 ## Steering Issues (`steer:`)
 
@@ -1808,6 +1810,26 @@ safe-outputs:
 
 Both approaches prevent noise while preserving actionable signals, but exclusion syntax is more concise when most categories should be reported.
 
+#### Reusable Workflows (Dynamic Configuration via Inputs)
+
+`report-failure-as-issue` (and `report-failed-jobs`, `failure-issue-repo`) accept a GitHub Actions expression instead of a literal value, so a `workflow_call`-triggered workflow can let each caller decide whether failures become issues:
+
+```yaml wrap
+on:
+  workflow_call:
+    inputs:
+      report-failure-as-issue:
+        description: When true, agent failures are reported as GitHub issues
+        required: false
+        type: boolean
+        default: true
+safe-outputs:
+  report-failure-as-issue: ${{ inputs.report-failure-as-issue }}
+  create-issue:
+```
+
+Callers that want to silence failure issues then pass `report-failure-as-issue: false` when invoking the reusable workflow, without editing its source. This avoids maintaining a separate copy of the workflow (or a post-compile patch of the generated `.lock.yml`) just to toggle failure reporting per caller.
+
 ### Failure Issue Repository (`failure-issue-repo:`)
 
 Redirects failure tracking issues to a different repository. Useful when the current repository has issues disabled (e.g. `github/docs-internal`).
@@ -1818,7 +1840,9 @@ safe-outputs:
   create-issue:
 ```
 
-The value must be in `owner/repo` format. The `GITHUB_TOKEN` used must have permission to create issues in the target repository. When not set, failure issues are created in the current repository.
+The value must be in `owner/repo` format, or a GitHub Actions expression that resolves to that format at runtime (e.g. `${{ inputs.failure-issue-repo }}` for a reusable workflow). The `GITHUB_TOKEN` used must have permission to create issues in the target repository. When not set, failure issues are created in the current repository.
+
+A literal `owner/repo` value is trusted compile-time configuration and may point at any repository. A value that comes from an expression is resolved at runtime from caller-supplied data, so it is validated before use: it must belong to the same owner as the repository running the workflow, otherwise it is ignored (with a warning) and failure issues are created in the current repository.
 
 ### Group Reports (`group-reports:`)
 
@@ -1849,8 +1873,9 @@ safe-outputs:
 - `secrets.NAME`
 - `needs.<job>.outputs.<name>`
 - `steps.<id>.outputs.<name>`
+- `steps.<id>.outputs.<name> || secrets.NAME [|| secrets.NAME ...]`
 
-The `steps.*.outputs.*` form is useful when a short-lived token is minted inside the job that uses it, for example with a keyless OIDC token-minting action. Step outputs are only readable inside the job that produced them, so the minting step must be injected into **every** job that consumes the token: the `agent` job (top-level `pre-steps:`), the `safe_outputs` job and the `conclusion` job (`jobs.<job>.pre-steps:` or `jobs.<job>.setup-steps:`).
+The `steps.*.outputs.*` forms are useful when a short-lived token is minted inside the job that uses it, for example with a keyless OIDC token-minting action. Add one or more `secrets.*` fallbacks when the minted output may be empty. Step outputs are only readable inside the job that produced them, so the minting step must be injected into **every** job that consumes the token: the `agent` job (top-level `pre-steps:`), the `safe_outputs` job and the `conclusion` job (`jobs.<job>.pre-steps:` or `jobs.<job>.setup-steps:`).
 
 `pre-steps:` run before the job's checkout, git-credential and token-consuming steps, so the minted token is available everywhere it is needed. `safe-outputs.steps:` is not a valid place to mint such a token because it runs *after* the `safe_outputs` job checkout.
 
@@ -1868,7 +1893,7 @@ pre-steps:                        # agent job
       identity: my-policy
 
 safe-outputs:
-  github-token: ${{ steps.mint_token.outputs.token }}
+  github-token: ${{ steps.mint_token.outputs.token || secrets.CUSTOM_PAT || secrets.GITHUB_TOKEN }}
   push-to-pull-request-branch:
 
 jobs:

@@ -651,7 +651,6 @@ func TestConclusionJobActionFailureIssueExpiration_DefaultFromRepoConfig(t *test
 			NoOp: &NoOpConfig{},
 		},
 	}
-
 	job, err := compiler.buildConclusionJob(workflowData, string(constants.AgentJobName), []string{})
 	if err != nil {
 		t.Fatalf("Failed to build conclusion job: %v", err)
@@ -1335,6 +1334,22 @@ func TestConclusionJobIncludesUsageArtifactSteps(t *testing.T) {
 	if !strings.Contains(allSteps, "Upload usage artifact") {
 		t.Errorf("Expected conclusion job to upload usage artifact.\nGenerated steps:\n%s", allSteps)
 	}
+	if !strings.Contains(allSteps, "id: upload-usage-artifact\n") {
+		t.Errorf("Expected initial usage artifact upload step ID.\nGenerated steps:\n%s", allSteps)
+	}
+	if !strings.Contains(allSteps, "name: Wait before retrying usage artifact upload\n") ||
+		!strings.Contains(allSteps, "run: sleep 10\n") {
+		t.Errorf("Expected delayed usage artifact upload retry.\nGenerated steps:\n%s", allSteps)
+	}
+	const usageArtifactUploadFailureCondition = "if: always() && steps.upload-usage-artifact.outcome == 'failure'\n"
+	if strings.Count(allSteps, usageArtifactUploadFailureCondition) != 2 {
+		t.Errorf("Expected both usage artifact retry steps to be gated on initial upload failure.\nGenerated steps:\n%s", allSteps)
+	}
+	retryUploadSteps := allSteps[strings.Index(allSteps, "name: Retry upload usage artifact"):]
+	if !strings.Contains(retryUploadSteps, "name: usage\n") ||
+		!strings.Contains(retryUploadSteps, "overwrite: true\n") {
+		t.Errorf("Expected usage artifact retry to overwrite the initial artifact.\nGenerated steps:\n%s", allSteps)
+	}
 	if !strings.Contains(allSteps, "/tmp/gh-aw/usage/aw_info.json") {
 		t.Errorf("Expected usage artifact to include aw_info.json path.\nGenerated steps:\n%s", allSteps)
 	}
@@ -1756,7 +1771,7 @@ func TestConclusionJobIssuesWritePermissionDerivedFromConfig(t *testing.T) {
 
 	t.Run("no issues: write or actions: read when all conclusion issue-writing paths are disabled", func(t *testing.T) {
 		compiler := NewCompiler()
-		falseReportFailedJobs := false
+		falseReportFailedJobs := TemplatableBool("false")
 		workflowData := &WorkflowData{
 			Name: "Test Workflow",
 			SafeOutputs: &SafeOutputsConfig{
@@ -1767,6 +1782,7 @@ func TestConclusionJobIssuesWritePermissionDerivedFromConfig(t *testing.T) {
 				},
 			},
 		}
+
 		job, err := compiler.buildConclusionJob(workflowData, string(constants.AgentJobName), []string{})
 		if err != nil {
 			t.Fatalf("buildConclusionJob returned error: %v", err)
@@ -1784,7 +1800,7 @@ func TestConclusionJobIssuesWritePermissionDerivedFromConfig(t *testing.T) {
 
 	t.Run("no issues: write when default threat detection is enabled but issue-writing paths are disabled", func(t *testing.T) {
 		compiler := NewCompiler()
-		falseReportFailedJobs := false
+		falseReportFailedJobs := TemplatableBool("false")
 		workflowData := &WorkflowData{
 			Name: "Test Workflow",
 			SafeOutputs: &SafeOutputsConfig{
@@ -1843,7 +1859,7 @@ func TestConclusionJobIssuesWritePermissionDerivedFromConfig(t *testing.T) {
 
 	t.Run("issues: read from safe-outputs is upgraded to issues: write when a conclusion issue path is enabled", func(t *testing.T) {
 		compiler := NewCompiler()
-		falseReportFailedJobs := false
+		falseReportFailedJobs := TemplatableBool("false")
 		workflowData := &WorkflowData{
 			Name: "Test Workflow",
 			SafeOutputs: &SafeOutputsConfig{
@@ -1867,7 +1883,7 @@ func TestConclusionJobIssuesWritePermissionDerivedFromConfig(t *testing.T) {
 
 	t.Run("issues: write present when missing-tool issue reporting is enabled", func(t *testing.T) {
 		compiler := NewCompiler()
-		falseReportFailedJobs := false
+		falseReportFailedJobs := TemplatableBool("false")
 		trueVal := "true"
 		workflowData := &WorkflowData{
 			Name: "Test Workflow",
@@ -1890,4 +1906,23 @@ func TestConclusionJobIssuesWritePermissionDerivedFromConfig(t *testing.T) {
 			t.Errorf("conclusion job should have 'issues: write' when missing-tool issue reporting is enabled, got: %q", job.Permissions)
 		}
 	})
+}
+
+func TestConclusionReportFailedJobsExpression(t *testing.T) {
+	compiler := NewCompiler()
+	reportFailedJobs := TemplatableBool("${{ inputs.report-failed-jobs }}")
+	steps := compiler.buildConclusionReportFailedJobsStep(&WorkflowData{
+		Name: "Test Workflow",
+		SafeOutputs: &SafeOutputsConfig{
+			ReportFailedJobs: &reportFailedJobs,
+		},
+	}, string(constants.AgentJobName))
+
+	output := strings.Join(steps, "")
+	if !strings.Contains(output, "GH_AW_REPORT_FAILED_JOBS: ${{ inputs.report-failed-jobs }}") {
+		t.Errorf("report-failed-jobs expression was not emitted unquoted: %q", output)
+	}
+	if strings.Contains(output, `GH_AW_REPORT_FAILED_JOBS: "${{ inputs.report-failed-jobs }}"`) {
+		t.Errorf("report-failed-jobs expression was emitted quoted: %q", output)
+	}
 }

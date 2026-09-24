@@ -9,7 +9,7 @@ The `gh aw audit` commands download workflow run artifacts and logs, analyze MCP
 
 ## `gh aw audit <run-id-or-url> [<run-id-or-url>...]`
 
-Audit one or more workflow runs. When a single run is provided, a detailed Markdown report is generated. When two or more runs are provided, the first is used as the base (reference) run and the remaining runs are compared against it, producing a diff report.
+Audit one or more workflow runs. When a single run is provided, a detailed Markdown report is generated. When two or more runs are provided, the first is used as the base (reference) run and the remaining runs are compared against it, producing a diff report. Add `--group` to aggregate findings instead of diffing runs.
 
 **Arguments:**
 
@@ -33,6 +33,7 @@ In single-run mode, a job URL without a step anchor extracts the first failing s
 | `--stdin` | off | Read run IDs or URLs from stdin (one per line) instead of positional arguments |
 | `--verbose` | off | Print detailed progress information |
 | `--format <fmt>` | `pretty` | Diff output format: `pretty` or `markdown` (multi-run only) |
+| `--group` | off | Group audit findings so each `[run, code]` pair appears once with an occurrence count and representative entry |
 
 Top-level fields in `--json` output are stable; nested sub-fields may be extended but are not removed without deprecation. Add `--parse` to populate `behavior_fingerprint` and `agentic_assessments`.
 
@@ -66,13 +67,45 @@ gh aw audit 12345 12346 12347 12348            # Compare base against 3 runs
 gh aw audit 12345 12346 --format markdown      # Markdown output for PR comments
 gh aw audit 12345 12346 --json                 # JSON for CI integration
 gh aw audit 12345 12346 --repo owner/repo      # Specify repository
+gh aw audit 12345 12346 --group                # Group findings by run and code
+gh aw audit 12345 12346 --group --json         # JSON grouped findings
 ```
 
-**Single-run report sections** (rendered in Markdown or JSON): Overview, Comparison, Task/Domain, Behavior Fingerprint, Agentic Assessments, Metrics, Key Findings, Recommendations, Observability Insights, Performance Metrics, Engine Config, Prompt Analysis, Session Analysis, Safe Output Summary, MCP Server Health, Jobs, Downloaded Files, Missing Tools, Missing Data, Noops, MCP Failures, Firewall Analysis, Policy Analysis, Redacted Domains, Errors, Warnings, Tool Usage, MCP Tool Usage, Created Items, Graders.
+**Single-run report sections** (rendered in Markdown or JSON): Overview, Comparison, Task/Domain, Behavior Fingerprint, Agentic Assessments, Metrics, Key Findings, Recommendations, Observability Insights, Performance Metrics, Engine Config, Prompt Analysis, Session Analysis, Safe Output Summary, MCP Server Health, Jobs, Downloaded Files, Missing Tools, Missing Data, Noops, MCP Failures, Gateway Steering Events, Firewall Analysis, Policy Analysis, Redacted Domains, Errors, Warnings, Tool Usage, MCP Tool Usage, Created Items, Graders.
+
+The Gateway Steering Events section reports `token_steering` and `timeout_steering` warnings emitted when a run approaches its AI Credits or time limit. JSON output includes each event's type, message, and timestamp when available.
 
 The Observability Insights section includes `skill_activations` when skill-invocation evidence is found. Each entry reports the skill name, `status` (`invoked`), the detection `source` (`agent_output` or `log_parse`), and provenance fields in JSON output. This makes it possible to distinguish skills that were merely restored or installed from skills that were actually invoked during the run.
 
 The Graders section is present when the run recorded deterministic grader results (`graders` declared in the workflow frontmatter). The `graders` object in JSON output lists each grader (`id`, `name`, `status`, `value`, `unit`, `passed`, and, when declared in the grader manifest, `direction` and `threshold`) plus aggregate counts: `total`, `passed`, `failed`, `error_count`, and `unavailable_count`. Grader results are read from the compact `usage` artifact (mirrored there by the conclusion job), the unified `agent` artifact, or the `agent-output-fallback` artifact, so they are available even when `--artifacts usage` narrows the download. The same `graders` object is included per run in `gh aw logs --json` output.
+
+### Audit finding codes
+
+Every `key_findings` entry includes a stable `code` for downstream automation. Titles and descriptions are human-readable and may change; consumers must use `code` to identify a finding type. Existing codes are not repurposed.
+
+The top-level `schema_version` identifies the audit cache and JSON contract version. Cached reports with an older version are regenerated before use.
+
+| Code | Finding |
+|---|---|
+| `workflow_failed` | The workflow failed |
+| `workflow_timeout` | The workflow timed out |
+| `high_token_usage` | Token usage exceeded the audit threshold |
+| `many_iterations` | The run exceeded the turn threshold |
+| `multiple_errors` | The run produced more than five errors |
+| `mcp_server_failures` | One or more MCP servers failed |
+| `tools_not_available` | Requested tools were unavailable |
+| `blocked_network_requests` | The firewall blocked network requests |
+| `workflow_succeeded` | The workflow completed successfully |
+| `threat_detection_job_failed` | The `detection` job failed |
+| `threat_detected` | The detection artifact identified one or more threats |
+| `agentic_resource_heavy_for_domain` | Resource use was high for the inferred task domain |
+| `agentic_overkill_for_agentic` | The task may not require an agentic workflow |
+| `agentic_poor_agentic_control` | Agentic control signals were weak |
+| `agentic_partially_reducible` | Part of the task could use deterministic steps |
+| `agentic_model_downgrade_available` | A smaller model may be sufficient |
+| `agentic_delegated_context_present` | Delegated workflow context was preserved |
+
+The audit inspects the `detection` job result and the downloaded `detection` artifact. A failed job emits `threat_detection_job_failed`. A structured verdict in `detection_result.json`, or a legacy `THREAT_DETECTION_RESULT` verdict in `detection.log`, emits `threat_detected` when `prompt_injection`, `secret_leak`, or `malicious_patch` is true. Threat reasons are not copied into the finding description because they may contain sensitive agent output.
 
 The Metrics section includes an `ambient_context` object when available. Ambient context captures the first LLM inference footprint for the run. It is absent when token-usage data is unavailable for the run — for example, when neither `token-usage.jsonl` nor the fallback `agent_usage.json` can be found in the downloaded artifacts, which is common for older runs and runs without firewall/usage artifacts:
 - `ambient_context.input_tokens` — input tokens for the first invocation
@@ -84,7 +117,7 @@ Working-Set Rebuild Factor measures cumulative context reconstruction relative t
 
 **Diff output** includes network changes (new, removed, and allow/deny flips), anomaly flags, MCP tool invocation changes, run-level metric deltas, token and AIC breakdowns, tokens per turn, per-tool call counts with max input/output sizes, and aggregated bash command usage.
 
-With multiple comparisons, `--json` emits a single object for one comparison or an array for many, while `--format pretty` and `--format markdown` separate each diff with dividers.
+With multiple comparisons, `--json` emits a single object for one comparison or an array for many, while `--format pretty` and `--format markdown` separate each diff with dividers. With `--group`, audit emits `runs_analyzed`, `entries`, and (when applicable) `skipped_runs`; each entry contains `run_id`, `code`, `occurrences`, and `representative_entry`. Only actionable findings (severity of low or above) are grouped. Runs excluded by `--experiment`, `--runtime`, or `--evals`, or whose audit data could not be loaded, are listed in `skipped_runs` and excluded from `runs_analyzed`.
 
 When artifacts are present, audit processing also persists extracted skill-activation data into `run_summary.json`, which downstream automation can consume alongside the rendered report.
 

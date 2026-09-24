@@ -27,6 +27,7 @@ const { parseBoolTemplatable } = require("./templatable.cjs");
 const { parseTokenUsageJsonl, generateTokenUsageSummary } = require("./parse_mcp_gateway_log.cjs");
 const { readDedupedTokenUsage, TOKEN_USAGE_PATHS } = require("./parse_token_usage.cjs");
 const { extractShellCommandFromToolData } = require("./tool_call_details.cjs");
+const { resolveFailureIssueRepo } = require("./repo_helpers.cjs");
 const fs = require("fs");
 const https = require("https");
 const os = require("os");
@@ -72,6 +73,24 @@ const COPILOT_ORG_BILLING_ERROR_RE = new RegExp(
   "i"
 );
 const ALLOWED_FILES_ERROR_RE = /^(?<summary>.*outside the allowed-files list) \((?<files>.+?)\)\. (?<remediation>Add the files to the allowed-files configuration field or remove them from the (?:patch|bundle)\.)$/;
+/**
+ * Copilot CLI error emitted at engine startup when `engine.agent` (the `--agent` flag) does
+ * not match any agent the CLI discovered, for example when a `plugins:` entry is pinned to a
+ * source-only ref that never materializes loadable agent files. Captures the requested agent
+ * identifier and the (possibly empty) comma-separated list of agents Copilot reports as
+ * available, e.g. `No such agent: foo:bar, available: `.
+ */
+const COPILOT_AGENT_NOT_FOUND_RE = /No such agent:\s*([^\n,]+),\s*available:\s*([^\n]*)/i;
+const COPILOT_AGENT_NOT_FOUND_AGENT_MAX_LENGTH = 200;
+const PLUGIN_DIAGNOSTICS_MAX_LENGTH = 8000;
+/**
+ * Fallback path for plugin installation diagnostics when GH_AW_AGENT_OUTPUT is unset
+ * (mirrors pluginDiagnosticsLogPath = logsFolder + "plugin-diagnostics.log" in
+ * pkg/workflow/plugin_installation.go / copilot_engine.go). readPluginDiagnosticsLog()
+ * uses this declared path for production runs because GH_AW_AGENT_OUTPUT points to
+ * /tmp/gh-aw/agent_output.json in downstream failure jobs, not the Copilot logs directory.
+ */
+const PLUGIN_DIAGNOSTICS_LOG_PATH = "/tmp/gh-aw/sandbox/agent/logs/plugin-diagnostics.log";
 
 /**
  * Parse action failure issue expiration from environment.
@@ -279,9 +298,9 @@ function buildFailureMatchCategories(options) {
   if (options.hasMissingData) categories.push("missing_data");
   if (options.hasCacheMissMisconfiguration) categories.push("cache_miss_misconfiguration");
   if (options.secretVerificationFailed) categories.push("secret_verification_failed");
-  if (options.hasDockerSbxSecretsFailed) categories.push("docker_sbx_secrets_missing");
   if (options.inferenceAccessError) categories.push("inference_access_error");
   if (options.copilotOrgBillingError) categories.push("copilot_org_billing_error");
+  if (options.copilotAgentNotFound) categories.push("copilot_agent_not_found");
   if (options.mcpPolicyError) categories.push("mcp_policy_error");
   if (options.modelNotSupportedError) categories.push("model_not_supported_error");
   if (options.http400ResponseError) categories.push("http_400_response_error");
@@ -333,8 +352,8 @@ function buildFailureMatchCategories(options) {
  * @param {boolean} options.hasAssignmentErrors
  * @param {boolean} options.http400ResponseError
  * @param {boolean} options.unknownModelAICredits
- * @param {boolean} [options.hasDockerSbxSecretsFailed]
  * @param {boolean} [options.copilotOrgBillingError]
+ * @param {string} [options.copilotAgentNotFound] - Requested agent identifier if a "No such agent" failure was detected
  * @param {boolean} [options.missingModelPricingError]
  * @param {string} [options.missingModelPricingModelName]
  * @param {boolean} [options.shellExpansionGuardRejected]
@@ -364,8 +383,11 @@ function buildFailureIssueTitle(options) {
   if (options.hasOAuthTokenCheckFailed) return `[aw] ${workflowName} has OAuth token misconfiguration`;
   if (options.hasStaleLockFileFailed) return `[aw] ${workflowName} has stale lock file`;
   if (options.shellExpansionGuardRejected) return `[aw] ${workflowName} hit shell expansion guard rejection`;
-  if (options.hasDockerSbxSecretsFailed) return `[aw] ${workflowName} is missing docker-sbx Docker Hub secrets`;
   if (options.copilotOrgBillingError) return `[aw] ${workflowName} hit Copilot organization billing error`;
+  if (options.copilotAgentNotFound) {
+    const agentName = sanitizeContent(options.copilotAgentNotFound, COPILOT_AGENT_NOT_FOUND_AGENT_MAX_LENGTH).replace(/\s+/g, " ").trim();
+    return `[aw] ${workflowName} could not find configured Copilot agent "${agentName}"`;
+  }
   if (options.isTimedOut) return `[aw] ${workflowName} timed out`;
   if (options.hasToolDenialsExceeded) return `[aw] ${workflowName} exceeded tool denial limit`;
   if (options.hasCacheMissMisconfiguration) return `[aw] ${workflowName} has cache-memory miss misconfiguration`;
@@ -1776,6 +1798,64 @@ function buildCopilotOrgBillingErrorContext(hasCopilotOrgBillingError) {
 }
 
 /**
+ * Build remediation for a Copilot CLI "No such agent" startup failure, including a rendering
+ * of the agent identifier that was requested, the agents Copilot reported as available, and
+ * the filesystem diagnostics recorded at plugin-install time (if any).
+ * @param {CopilotAgentNotFoundDetection|null} detection
+ * @returns {string}
+ */
+function buildCopilotAgentNotFoundContext(detection) {
+  if (!detection) {
+    return "";
+  }
+
+  const requestedAgent = sanitizeContent(detection.requestedAgent, COPILOT_AGENT_NOT_FOUND_AGENT_MAX_LENGTH);
+  const availableAgents =
+    detection.availableAgents.length > 0
+      ? detection.availableAgents.map(agent => renderSafeInlineCodeSpan(sanitizeContent(agent, COPILOT_AGENT_NOT_FOUND_AGENT_MAX_LENGTH))).join(", ")
+      : "_(none — Copilot CLI discovered no loadable agents)_";
+  const diagnosticsLog = readPluginDiagnosticsLog();
+  const pluginDiagnostics = diagnosticsLog ? renderPluginDiagnosticsDetails(diagnosticsLog) : "";
+
+  return (
+    "\n" +
+    renderPromptTemplate("copilot_agent_not_found.md", {
+      requested_agent: renderSafeInlineCodeSpan(requestedAgent),
+      available_agents: availableAgents,
+      plugin_diagnostics: pluginDiagnostics,
+    })
+  );
+}
+
+/**
+ * Render a value as an inline Markdown code span using a delimiter longer than any backtick run
+ * present in the value.
+ * @param {string} value
+ * @returns {string}
+ */
+function renderSafeInlineCodeSpan(value) {
+  const text = value.replace(/\s+/g, " ").trim();
+  let longestBacktickRun = 0;
+  for (const run of text.match(/`+/g) || []) {
+    longestBacktickRun = Math.max(longestBacktickRun, run.length);
+  }
+  const fence = "`".repeat(longestBacktickRun + 1);
+  const padding = text.startsWith("`") || text.endsWith("`") ? " " : "";
+  return `${fence}${padding}${text}${padding}${fence}`;
+}
+
+/**
+ * Render sanitized plugin diagnostics inside a code fence that cannot be closed by the log.
+ * @param {string} diagnosticsLog
+ * @returns {string}
+ */
+function renderPluginDiagnosticsDetails(diagnosticsLog) {
+  const sanitizedDiagnostics = sanitizeContent(diagnosticsLog, { maxLength: PLUGIN_DIAGNOSTICS_MAX_LENGTH });
+  const fence = safeMarkdownCodeFence([sanitizedDiagnostics]);
+  return `\n\n<details>\n<summary>Plugin installation diagnostics</summary>\n\n${fence}\n${sanitizedDiagnostics}\n${fence}\n\n</details>\n`;
+}
+
+/**
  * Build a context string when MCP servers were blocked by enterprise/organization policy.
  * This is a persistent configuration error — retrying will not help.
  * @param {boolean} hasMCPPolicyError - Whether an MCP policy error was detected
@@ -2360,16 +2440,24 @@ function buildDailyAICGuardrailGuidance(status, error) {
  * @param {boolean} hasDailyAICGuardrailError
  * @param {string} status
  * @param {string} error
+ * @param {boolean} [continueOnError] - When true, the guardrail is configured in warning mode:
+ *   the agent still ran despite the unverifiable accounting, so the impact wording must not
+ *   claim the agent was never started.
  * @returns {string}
  */
-function buildDailyAICGuardrailErrorContext(hasDailyAICGuardrailError, status, error) {
+function buildDailyAICGuardrailErrorContext(hasDailyAICGuardrailError, status, error, continueOnError) {
   if (!hasDailyAICGuardrailError) {
     return "";
   }
 
+  const impactNote = continueOnError
+    ? "The daily guardrail could not prove complete AI Credits accounting for earlier workflow runs. The guardrail is configured in warning mode (`continue-on-error: true`), so the agent still ran; this report is informational."
+    : "The agent was not started because the daily guardrail could not prove complete AI Credits accounting for earlier workflow runs.";
+
   return (
     "\n" +
     renderTemplateFromFile(getPromptPath("daily_workflow_aic_unknown.md"), {
+      impact_note: impactNote,
       status: sanitizeContent(status, 100) || "unknown_error",
       error: sanitizeContent(error, 2000) || "The daily guardrail did not provide an error reason.",
       guidance: buildDailyAICGuardrailGuidance(status, error),
@@ -2708,18 +2796,6 @@ function buildSecretVerificationContext(secretVerificationResult, engineSecretFa
 }
 
 /**
- * Build a docker-sbx setup context from the dedicated runtime guidance template.
- * @param {string} dockerSbxSecretsResult
- * @returns {string}
- */
-function buildDockerSbxSecretsContext(dockerSbxSecretsResult) {
-  if (dockerSbxSecretsResult !== "failed") {
-    return "";
-  }
-  return renderPromptTemplate("docker_sbx_secrets_missing.md");
-}
-
-/**
  * Check whether agent-stdio.log contains a terminal_reason: "completed" result entry,
  * indicating the agent finished its task successfully despite a non-zero job exit code.
  * Log lines may be prefixed with a timestamp (e.g. "2026-04-27T21:45:00.080Z  {JSON}").
@@ -2770,6 +2846,59 @@ function detectCopilotOrgBillingErrorFromLog(stdioLogPathOverride) {
     return COPILOT_ORG_BILLING_MODE_RE.test(logContent) && COPILOT_ORG_BILLING_ERROR_RE.test(logContent);
   } catch {
     return false;
+  }
+}
+
+/**
+ * @typedef {Object} CopilotAgentNotFoundDetection
+ * @property {string} requestedAgent - The agent identifier passed via `engine.agent`/`--agent`
+ * @property {string[]} availableAgents - Agents the Copilot CLI reported as available (may be empty)
+ */
+
+/**
+ * Detect the Copilot CLI's "No such agent" startup failure, which occurs when `engine.agent`
+ * does not match any agent the CLI discovered (for example when a `plugins:` entry is pinned
+ * to a ref that does not materialize loadable agent files).
+ * @param {string} [stdioLogPathOverride] - Explicit agent-stdio.log path; only used by tests, production callers rely on GH_AW_AGENT_OUTPUT
+ * @returns {CopilotAgentNotFoundDetection|null}
+ */
+function detectCopilotAgentNotFoundFromLog(stdioLogPathOverride) {
+  if (process.env.GH_AW_ENGINE_ID !== "copilot") {
+    return null;
+  }
+
+  const agentOutputFile = process.env.GH_AW_AGENT_OUTPUT;
+  const stdioLogPath = stdioLogPathOverride || (agentOutputFile ? path.join(path.dirname(agentOutputFile), "agent-stdio.log") : "/tmp/gh-aw/agent-stdio.log");
+  try {
+    const logContent = fs.readFileSync(stdioLogPath, "utf8");
+    const match = logContent.match(COPILOT_AGENT_NOT_FOUND_RE);
+    if (!match) {
+      return null;
+    }
+    const requestedAgent = match[1].trim();
+    const availableRaw = match[2].trim();
+    const availableAgents = availableRaw
+      .split(",")
+      .map(agent => agent.trim())
+      .filter(Boolean);
+    return { requestedAgent, availableAgents };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read the filesystem diagnostics recorded during plugin installation
+ * (see pluginDiagnosticsLogPath in pkg/workflow/plugin_installation.go), if present.
+ * GH_AW_PLUGIN_DIAGNOSTICS_FILE is an explicit override used by tests.
+ * @returns {string} Diagnostics log content, or "" when unavailable
+ */
+function readPluginDiagnosticsLog() {
+  const diagnosticsPath = process.env.GH_AW_PLUGIN_DIAGNOSTICS_FILE || PLUGIN_DIAGNOSTICS_LOG_PATH;
+  try {
+    return fs.readFileSync(diagnosticsPath, "utf8").trim();
+  } catch {
+    return "";
   }
 }
 
@@ -3575,7 +3704,6 @@ async function main() {
     const workflowSource = process.env.GH_AW_WORKFLOW_SOURCE || "";
     const workflowSourceURL = process.env.GH_AW_WORKFLOW_SOURCE_URL || "";
     const secretVerificationResult = process.env.GH_AW_SECRET_VERIFICATION_RESULT || "";
-    const dockerSbxSecretsResult = process.env.GH_AW_DOCKER_SBX_SECRETS_RESULT || "";
     const engineSecretFailureMessage = process.env.GH_AW_ENGINE_SECRET_FAILURE_MESSAGE || "";
     const assignmentErrors = process.env.GH_AW_ASSIGNMENT_ERRORS || "";
     const assignmentErrorCount = process.env.GH_AW_ASSIGNMENT_ERROR_COUNT || "0";
@@ -3593,6 +3721,7 @@ async function main() {
     const aiCreditsRateLimitError = agentConclusion === "failure" && detectedAICreditsRateLimitError;
     const inferenceAccessError = process.env.GH_AW_INFERENCE_ACCESS_ERROR === "true";
     const copilotOrgBillingError = detectCopilotOrgBillingErrorFromLog();
+    const copilotAgentNotFound = detectCopilotAgentNotFoundFromLog();
     const mcpPolicyError = process.env.GH_AW_MCP_POLICY_ERROR === "true";
     const agenticEngineTimeout = process.env.GH_AW_AGENTIC_ENGINE_TIMEOUT === "true";
     const modelNotSupportedError = process.env.GH_AW_MODEL_NOT_SUPPORTED_ERROR === "true";
@@ -3668,6 +3797,12 @@ async function main() {
     const dailyAICGuardrailStatus = process.env.GH_AW_DAILY_AI_CREDITS_GUARDRAIL_STATUS || "";
     const dailyAICGuardrailError = process.env.GH_AW_DAILY_AI_CREDITS_GUARDRAIL_ERROR || "";
     const hasDailyAICGuardrailError = dailyAICGuardrailStatus === "structural_error" || dailyAICGuardrailStatus === "transient_error";
+    // When continue-on-error is configured for max-daily-ai-credits, unknown/unverifiable
+    // accounting is a warning: the guardrail step does not block the agent job, so an unknown
+    // status alone must not be treated as an agent-failure trigger or reported with fail-closed
+    // wording that claims the agent was never started.
+    const dailyAICContinueOnError = process.env.GH_AW_DAILY_AI_CREDITS_CONTINUE_ON_ERROR === "true";
+    const dailyAICGuardrailErrorIsFailure = hasDailyAICGuardrailError && !dailyAICContinueOnError;
     const dailyAICTotal = process.env.GH_AW_DAILY_AI_CREDITS_TOTAL || "";
     const dailyAICThreshold = process.env.GH_AW_DAILY_AI_CREDITS_THRESHOLD || "";
     // Cache-memory availability flag — set when cache-memory is configured for the workflow.
@@ -3713,6 +3848,7 @@ async function main() {
     core.info(`Max AI credits exceeded (harness budget abort): ${maxAICreditsExceeded}`);
     core.info(`Daily workflow AIC guardrail exceeded: ${hasDailyAICExceeded}`);
     core.info(`Daily workflow AIC guardrail status: ${dailyAICGuardrailStatus || "(none)"}; error detail: ${dailyAICGuardrailError ? "(set)" : "(none)"}`);
+    core.info(`Daily workflow AIC guardrail continue-on-error (warning mode): ${dailyAICContinueOnError}`);
     core.info(`Inference access error: ${inferenceAccessError}`);
     core.info(`MCP policy error: ${mcpPolicyError}`);
     core.info(`Agentic engine timeout: ${agenticEngineTimeout}`);
@@ -3895,15 +4031,12 @@ async function main() {
     // OR a cache-miss was detected after cache restore succeeded (configuration problem)
     // OR the agent reported missing tools or missing data (treated as agent failures by default)
     // OR the secret validation step failed (engine secret missing)
-    // OR docker-sbx is configured but its required Docker Hub secrets are missing.
     // BUT skip if we only have noop outputs (that's a successful no-action scenario)
     const hasSecretVerificationFailed = secretVerificationResult === "failed";
-    const hasDockerSbxSecretsFailed = dockerSbxSecretsResult === "failed";
     if (
       agentConclusion !== "failure" &&
       !isTimedOut &&
       !hasSecretVerificationFailed &&
-      !hasDockerSbxSecretsFailed &&
       !hasAssignmentErrors &&
       !hasAssignCopilotFailures &&
       !hasSkillInstallFailures &&
@@ -3916,7 +4049,7 @@ async function main() {
       !hasOAuthTokenCheckFailed &&
       !hasStaleLockFileFailed &&
       !hasDailyAICExceeded &&
-      !hasDailyAICGuardrailError &&
+      !dailyAICGuardrailErrorIsFailure &&
       !hasReportIncomplete &&
       !hasCacheMissMisconfiguration &&
       !aiCreditsRateLimitError &&
@@ -3926,7 +4059,7 @@ async function main() {
       !hasToolDenialsExceeded
     ) {
       core.info(
-        `Agent job did not fail and no assignment/discussion/code-push/push-repo-memory/app-token/lockdown/oauth-token-check/stale-lock-file/daily-workflow-aic/daily-workflow-aic-accounting/ai-credits/max-ai-credits-exceeded/report-incomplete/cache-miss/missing-tool/missing-data/tool-denials-exceeded/secret-verification/docker-sbx-secret errors and has safe outputs (conclusion: ${agentConclusion}), skipping failure handling`
+        `Agent job did not fail and no assignment/discussion/code-push/push-repo-memory/app-token/lockdown/oauth-token-check/stale-lock-file/daily-workflow-aic/daily-workflow-aic-accounting/ai-credits/max-ai-credits-exceeded/report-incomplete/cache-miss/missing-tool/missing-data/tool-denials-exceeded/secret-verification errors and has safe outputs (conclusion: ${agentConclusion}), skipping failure handling`
       );
       return;
     }
@@ -3961,20 +4094,21 @@ async function main() {
     }
 
     // Determine the failure issue repository destination.
-    // SEC-005: GH_AW_FAILURE_ISSUE_REPO is set in the workflow frontmatter at compile time
-    // and is therefore a trusted compile-time configuration value. No validateTargetRepo
-    // allowlist check is required; the frontmatter trust boundary provides the equivalent
-    // security guarantee.
-    // If GH_AW_FAILURE_ISSUE_REPO is set, use that repo instead of the current repo
-    const failureIssueRepo = process.env.GH_AW_FAILURE_ISSUE_REPO || "";
+    // SEC-005: a literal GH_AW_FAILURE_ISSUE_REPO is set in the workflow frontmatter at
+    // compile time and is therefore trusted configuration. When the frontmatter used a
+    // GitHub Actions expression (e.g. a reusable-workflow input) the value is resolved at
+    // runtime from caller-controlled data, so resolveFailureIssueRepo validates it with
+    // validateTargetRepo against an allowlist scoped to the current repository owner.
+    const { owner: contextOwner, repo: contextRepo } = context.repo;
+    const failureRepoParts = resolveFailureIssueRepo(`${contextOwner}/${contextRepo}`, message => core.warning(message));
     let owner, repo;
-    if (failureIssueRepo && failureIssueRepo.includes("/")) {
-      const parts = failureIssueRepo.split("/");
-      owner = parts[0];
-      repo = parts[1];
+    if (failureRepoParts) {
+      owner = failureRepoParts.owner;
+      repo = failureRepoParts.repo;
       core.info(`Using configured failure issue repo: ${owner}/${repo}`);
     } else {
-      ({ owner, repo } = context.repo);
+      owner = contextOwner;
+      repo = contextRepo;
     }
 
     /** @type {{ number: number, labels: Array<string | { name?: string | null }> } | null} */
@@ -4009,22 +4143,6 @@ async function main() {
     });
     const actionFailureIssueExpiresHours = getActionFailureIssueExpiresHours();
 
-    // Check if parent issue creation is enabled (defaults to false)
-    const groupReports = process.env.GH_AW_GROUP_REPORTS === "true";
-
-    // Ensure parent issue exists first (only if enabled)
-    let parentIssue;
-    if (groupReports) {
-      try {
-        parentIssue = await ensureParentIssue(null, owner, repo, actionFailureIssueExpiresHours);
-      } catch (error) {
-        core.warning(`Could not create parent issue, proceeding without parent: ${getErrorMessage(error)}`);
-        // Continue without parent issue
-      }
-    } else {
-      core.info("Parent issue creation is disabled (group-reports: false)");
-    }
-
     // Sanitize workflow name for title
     const sanitizedWorkflowName = sanitizeContent(workflowName, { maxLength: 100 });
     const issueTitle = buildFailureIssueTitle({
@@ -4041,7 +4159,7 @@ async function main() {
       hasOAuthTokenCheckFailed,
       hasStaleLockFileFailed,
       hasDailyAICExceeded,
-      hasDailyAICGuardrailError,
+      hasDailyAICGuardrailError: dailyAICGuardrailErrorIsFailure,
       aiCreditsRateLimitError,
       hasEngineRateLimit429,
       maxAICreditsExceeded,
@@ -4051,8 +4169,8 @@ async function main() {
       unknownModelAICredits,
       missingModelPricingError,
       missingModelPricingModelName,
-      hasDockerSbxSecretsFailed,
       copilotOrgBillingError,
+      copilotAgentNotFound: copilotAgentNotFound?.requestedAgent,
     });
     const failureCategories = buildFailureMatchCategories({
       agentConclusion,
@@ -4071,9 +4189,9 @@ async function main() {
       hasMissingData,
       hasCacheMissMisconfiguration,
       secretVerificationFailed: hasSecretVerificationFailed,
-      hasDockerSbxSecretsFailed,
       inferenceAccessError,
       copilotOrgBillingError,
+      copilotAgentNotFound: Boolean(copilotAgentNotFound),
       mcpPolicyError,
       modelNotSupportedError,
       http400ResponseError,
@@ -4087,7 +4205,7 @@ async function main() {
       hasOAuthTokenCheckFailed,
       hasStaleLockFileFailed,
       hasDailyAICExceeded,
-      hasDailyAICGuardrailError,
+      hasDailyAICGuardrailError: dailyAICGuardrailErrorIsFailure,
       isAWFFirewallStartupFailed: detectAWFFirewallStartupFailureFromLog(),
     });
 
@@ -4145,6 +4263,22 @@ async function main() {
       if (!shouldCreateIssue) {
         return;
       }
+    }
+
+    // Check if parent issue creation is enabled (defaults to false)
+    const groupReports = process.env.GH_AW_GROUP_REPORTS === "true";
+
+    // Ensure parent issue exists first (only if enabled)
+    let parentIssue;
+    if (groupReports) {
+      try {
+        parentIssue = await ensureParentIssue(null, owner, repo, actionFailureIssueExpiresHours);
+      } catch (error) {
+        core.warning(`Could not create parent issue, proceeding without parent: ${getErrorMessage(error)}`);
+        // Continue without parent issue
+      }
+    } else {
+      core.info("Parent issue creation is disabled (group-reports: false)");
     }
 
     core.info(`Checking for existing issue with precise failure metadata for title: "${issueTitle}"`);
@@ -4250,6 +4384,7 @@ async function main() {
 
         // Build inference access error context
         const copilotOrgBillingErrorContext = buildCopilotOrgBillingErrorContext(copilotOrgBillingError);
+        const copilotAgentNotFoundContext = buildCopilotAgentNotFoundContext(copilotAgentNotFound);
         const inferenceAccessErrorContext = copilotOrgBillingErrorContext ? "" : buildInferenceAccessErrorContext(inferenceAccessError);
 
         // Build MCP policy error context
@@ -4273,7 +4408,7 @@ async function main() {
         // Build stale lock file failure context
         const staleLockFileFailedContext = buildStaleLockFileFailedContext(hasStaleLockFileFailed);
         const dailyAICExceededContext = buildDailyAICExceededContext(hasDailyAICExceeded, dailyAICTotal, dailyAICThreshold);
-        const dailyAICGuardrailErrorContext = buildDailyAICGuardrailErrorContext(hasDailyAICGuardrailError, dailyAICGuardrailStatus, dailyAICGuardrailError);
+        const dailyAICGuardrailErrorContext = buildDailyAICGuardrailErrorContext(hasDailyAICGuardrailError, dailyAICGuardrailStatus, dailyAICGuardrailError, dailyAICContinueOnError);
 
         // Build copilot assignment failure context for created issues
         const assignCopilotFailureContext = buildAssignCopilotFailureContext(hasAssignCopilotFailures, assignCopilotErrors);
@@ -4293,9 +4428,9 @@ async function main() {
           workflow_source_url: workflowSourceURL,
           secret_verification_failed: String(hasSecretVerificationFailed),
           secret_verification_context: buildSecretVerificationContext(secretVerificationResult, engineSecretFailureMessage),
-          docker_sbx_secrets_context: buildDockerSbxSecretsContext(dockerSbxSecretsResult),
           credential_auth_error_context: credentialAuthErrorContext,
           copilot_org_billing_error_context: copilotOrgBillingErrorContext,
+          copilot_agent_not_found_context: copilotAgentNotFoundContext,
           assignment_errors_context: assignmentErrorsContext,
           assign_copilot_failure_context: assignCopilotFailureContext,
           skill_install_failure_context: skillInstallFailureContext,
@@ -4484,6 +4619,7 @@ async function main() {
 
         // Build inference access error context
         const copilotOrgBillingErrorContext = buildCopilotOrgBillingErrorContext(copilotOrgBillingError);
+        const copilotAgentNotFoundContext = buildCopilotAgentNotFoundContext(copilotAgentNotFound);
         const inferenceAccessErrorContext = copilotOrgBillingErrorContext ? "" : buildInferenceAccessErrorContext(inferenceAccessError);
 
         // Build MCP policy error context
@@ -4507,7 +4643,7 @@ async function main() {
         // Build stale lock file failure context
         const staleLockFileFailedContext = buildStaleLockFileFailedContext(hasStaleLockFileFailed);
         const dailyAICExceededContext = buildDailyAICExceededContext(hasDailyAICExceeded, dailyAICTotal, dailyAICThreshold);
-        const dailyAICGuardrailErrorContext = buildDailyAICGuardrailErrorContext(hasDailyAICGuardrailError, dailyAICGuardrailStatus, dailyAICGuardrailError);
+        const dailyAICGuardrailErrorContext = buildDailyAICGuardrailErrorContext(hasDailyAICGuardrailError, dailyAICGuardrailStatus, dailyAICGuardrailError, dailyAICContinueOnError);
 
         // Build copilot assignment failure context for created issues
         const assignCopilotFailureContext = buildAssignCopilotFailureContext(hasAssignCopilotFailures, assignCopilotErrors);
@@ -4531,9 +4667,9 @@ async function main() {
           pull_request_info: pullRequest ? `  \n**Pull Request:** [#${pullRequest.number}](${pullRequest.html_url})` : "",
           secret_verification_failed: String(hasSecretVerificationFailed),
           secret_verification_context: buildSecretVerificationContext(secretVerificationResult, engineSecretFailureMessage),
-          docker_sbx_secrets_context: buildDockerSbxSecretsContext(dockerSbxSecretsResult),
           credential_auth_error_context: credentialAuthErrorContext,
           copilot_org_billing_error_context: copilotOrgBillingErrorContext,
+          copilot_agent_not_found_context: copilotAgentNotFoundContext,
           assignment_errors_context: assignmentErrorsContext,
           assign_copilot_failure_context: assignCopilotFailureContext,
           skill_install_failure_context: skillInstallFailureContext,
@@ -4681,6 +4817,8 @@ module.exports = {
   buildMCPPolicyErrorContext,
   buildCopilotOrgBillingErrorContext,
   detectCopilotOrgBillingErrorFromLog,
+  buildCopilotAgentNotFoundContext,
+  detectCopilotAgentNotFoundFromLog,
   buildModelNotSupportedErrorContext,
   buildHTTP400ResponseErrorContext,
   buildMissingDataContext,
@@ -4716,7 +4854,6 @@ module.exports = {
   detectAndHandleFailureCascade,
   findRecentFailureIssues,
   buildSecretVerificationContext,
-  buildDockerSbxSecretsContext,
   CASCADE_WINDOW_MINUTES,
   CASCADE_WINDOW_MS,
   CASCADE_THRESHOLD,

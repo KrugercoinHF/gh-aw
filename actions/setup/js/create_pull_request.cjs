@@ -13,7 +13,7 @@ const { sanitizeTitle, applyTitlePrefix } = require("./sanitize_title.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { replaceTemporaryIdReferences, replaceTemporaryIdReferencesInPatch, getOrGenerateTemporaryId } = require("./temporary_id.cjs");
-const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
+const { resolveTargetRepoConfig, resolveAndValidateRepo, resolveFailureIssueRepo } = require("./repo_helpers.cjs");
 const { addExpirationToFooter } = require("./ephemerals.cjs");
 const { generateWorkflowIdMarker, generateWorkflowCallIdMarker, generateCloseKeyMarker, normalizeCloseOlderKey } = require("./generate_footer.cjs");
 const { parseBoolTemplatable, parseIntTemplatable } = require("./templatable.cjs");
@@ -50,6 +50,7 @@ const {
   summarizeListForLog,
   createBundleTempRef,
   isLabelTransientError,
+  withTransientPushRetry,
   parseAllowedBaseBranches,
   isBaseBranchAllowed,
   parseStringListConfig,
@@ -506,8 +507,11 @@ async function createFallbackIssue(githubClient, repoParts, title, body, labels,
       if (status === 410) {
         const originalTarget = `${payload.owner}/${payload.repo}`;
         triedOwnerRepos.add(originalTarget.toLowerCase());
-        const failureRepo = parseRepo(process.env.GH_AW_FAILURE_ISSUE_REPO || "");
-        const workflowRepo = parseRepo(process.env.GITHUB_REPOSITORY || "");
+        const workflowRepoSlug = process.env.GITHUB_REPOSITORY || "";
+        // SEC-005: validate expression-derived failure-issue-repo values before using
+        // them as an API target (literal frontmatter values stay trusted).
+        const failureRepo = resolveFailureIssueRepo(workflowRepoSlug, message => core.warning(message));
+        const workflowRepo = parseRepo(workflowRepoSlug);
         const alt = [failureRepo, workflowRepo].find(r => r !== null && !triedOwnerRepos.has(`${r.owner}/${r.repo}`.toLowerCase()));
 
         if (alt) {
@@ -1153,7 +1157,7 @@ async function main(config = {}) {
           core.warning(`Repository ${itemRepo} not found in checkout mapping or workspace`);
           return {
             success: false,
-            error: `Repository '${itemRepo}' not found in workspace. Configure it in checkout: with a path to enable multi-repo PR creation.`,
+            error: checkoutResult.error,
           };
         }
       }
@@ -1779,9 +1783,19 @@ async function main(config = {}) {
       // First, fetch the base branch specifically (since we use shallow checkout)
       core.info(`Fetching base branch: ${baseBranch}`);
 
-      // Fetch without creating/updating local branch to avoid conflicts with current branch
-      // This works even when we're already on the base branch
-      await exec.exec("git", ["fetch", "origin", baseBranch]);
+      // Fetch without creating/updating local branch to avoid conflicts with current branch.
+      // For a shallow checkout that has not fetched the base ref, use depth one to avoid
+      // expensive shallow negotiation. Do not re-truncate an existing base ref's history.
+      const shallowProbe = await exec.getExecOutput("git", ["rev-parse", "--is-shallow-repository"], { ignoreReturnCode: true });
+      const isShallowRepo = shallowProbe.exitCode === 0 && shallowProbe.stdout.trim() === "true";
+      let fetchArgs = ["fetch", "origin", baseBranch];
+      if (isShallowRepo) {
+        const { exitCode: baseRefExitCode } = await exec.getExecOutput("git", ["show-ref", "--verify", "--quiet", `refs/remotes/origin/${baseBranch}`], { ignoreReturnCode: true });
+        if (baseRefExitCode !== 0) {
+          fetchArgs = ["fetch", "--depth=1", "origin", baseBranch];
+        }
+      }
+      await exec.exec("git", fetchArgs);
 
       // Apply the patch/bundle using git CLI (skip if empty)
       // Track number of new commits pushed so we can restrict the extra empty commit
@@ -1833,7 +1847,7 @@ async function main(config = {}) {
             });
           };
           try {
-            await runBundlePush();
+            await withTransientPushRetry(runBundlePush);
             core.info("Changes pushed to branch (from bundle)");
 
             // Count new commits on PR branch relative to base
@@ -2228,7 +2242,7 @@ ${issueSafeFallbackFooter}`;
               });
             };
             try {
-              await runPatchPush();
+              await withTransientPushRetry(runPatchPush);
               core.info("Changes pushed to branch");
 
               // Count new commits on PR branch relative to base, used to restrict
@@ -2554,6 +2568,7 @@ ${issueSafeFallbackFooter}`;
           title,
           body,
           branchName: getPullRequestHeadRef(branchName),
+          headRepo: pushRepo.toLowerCase() === itemRepo.toLowerCase() ? undefined : pushRepo,
           baseBranch,
           draft,
         });

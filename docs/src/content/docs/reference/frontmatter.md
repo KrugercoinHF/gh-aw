@@ -367,7 +367,7 @@ safe-outputs:
   report-failed-jobs: false
 ```
 
-When omitted, `report-failed-jobs` defaults to `true`.
+`report-failed-jobs` also accepts a GitHub Actions expression that resolves to a boolean. When omitted, it defaults to `true`.
 
 Custom safe-output jobs are defined under `safe-outputs.jobs:`. They run after the agent completes and can expose a custom safe-output tool to the agent. The optional `output` field is the success message returned to the agent:
 
@@ -464,7 +464,7 @@ The top-level `max-runs:` field is a **deprecated** alias for `max-turns:` and i
 
 ### Turn Cache Miss Limit (`max-turn-cache-misses:`)
 
-Sets the maximum consecutive AWF cache misses allowed before the API proxy blocks further requests. The value maps to `apiProxy.maxCacheMisses`, must be a positive integer, and defaults to `5` when neither frontmatter nor the `GH_AW_DEFAULT_MAX_TURN_CACHE_MISSES` environment override provides a value.
+Sets the maximum consecutive AWF cache misses allowed before the API proxy blocks further requests. The value maps to `apiProxy.maxCacheMisses`, must be a positive integer, and defaults to `5` when neither frontmatter nor the `GH_AW_DEFAULT_MAX_TURN_CACHE_MISSES` environment override provides a value. The configured value also applies to the threat-detection job, which talks to the same LLM provider.
 
 ```yaml wrap
 max-turn-cache-misses: 5
@@ -501,6 +501,14 @@ max-daily-ai-credits:
   github-app:
     client-id: ${{ vars.APP_ID }}
     private-key: ${{ secrets.APP_PRIVATE_KEY }}
+```
+
+By default, the activation job fails when the guardrail cannot determine the complete 24-hour AI Credits total. Set `continue-on-error: true` to report the unknown total as a warning and allow the workflow to continue:
+
+```yaml wrap
+max-daily-ai-credits:
+  value: 10000
+  continue-on-error: true
 ```
 
 ```yaml wrap

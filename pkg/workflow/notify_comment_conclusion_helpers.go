@@ -238,9 +238,6 @@ func (c *Compiler) buildAgentFailureCoreVars(data *WorkflowData, mainJobName str
 			}
 		}
 	}
-	if isDockerSbxRuntime(data) {
-		envVars = append(envVars, fmt.Sprintf("          GH_AW_DOCKER_SBX_SECRETS_RESULT: ${{ needs.%s.outputs.docker_sbx_secrets_result }}\n", constants.ActivationJobName))
-	}
 	if ShouldGeneratePRCheckoutStep(data) {
 		envVars = append(envVars, fmt.Sprintf("          GH_AW_CHECKOUT_PR_SUCCESS: ${{ needs.%s.outputs.checkout_pr_success }}\n", mainJobName))
 	}
@@ -335,6 +332,7 @@ func buildAgentFailureActivationStatusVars(data *WorkflowData) []string {
 		envVars = append(envVars, fmt.Sprintf("          GH_AW_DAILY_AI_CREDITS_GUARDRAIL_ERROR: ${{ needs.%s.outputs.daily_ai_credits_guardrail_error }}\n", constants.ActivationJobName))
 		envVars = append(envVars, fmt.Sprintf("          GH_AW_DAILY_AI_CREDITS_TOTAL: ${{ needs.%s.outputs.daily_ai_credits_total }}\n", constants.ActivationJobName))
 		envVars = append(envVars, fmt.Sprintf("          GH_AW_DAILY_AI_CREDITS_THRESHOLD: ${{ needs.%s.outputs.daily_ai_credits_threshold }}\n", constants.ActivationJobName))
+		envVars = append(envVars, fmt.Sprintf("          GH_AW_DAILY_AI_CREDITS_CONTINUE_ON_ERROR: %q\n", strconv.FormatBool(data.MaxDailyAICContinueOnError)))
 	}
 	return envVars
 }
@@ -412,6 +410,13 @@ func buildAgentFailureCacheMemoryVars(data *WorkflowData, mainJobName string) []
 	var envVars []string
 	if data.SafeOutputs.FailureIssueRepo != "" {
 		envVars = append(envVars, fmt.Sprintf("          GH_AW_FAILURE_ISSUE_REPO: %q\n", data.SafeOutputs.FailureIssueRepo))
+		// SEC-005: a literal "owner/repo" written in the frontmatter is trusted
+		// compile-time configuration. Values built from GitHub Actions expressions are
+		// resolved at runtime from caller-controlled data (e.g. reusable-workflow inputs),
+		// so flag them for allowlist validation by the failure-reporting scripts.
+		if hasExpressionMarker(data.SafeOutputs.FailureIssueRepo) {
+			envVars = append(envVars, "          GH_AW_FAILURE_ISSUE_REPO_FROM_EXPRESSION: \"true\"\n")
+		}
 	}
 	if timeoutValue := strings.TrimPrefix(data.TimeoutMinutes, "timeout-minutes: "); timeoutValue != "" {
 		envVars = append(envVars, fmt.Sprintf("          GH_AW_TIMEOUT_MINUTES: %q\n", timeoutValue))
@@ -514,10 +519,6 @@ func (c *Compiler) buildConclusionJobCondition(data *WorkflowData, mainJobName s
 		secretVerificationFailed := BuildEquals(BuildPropertyAccess(fmt.Sprintf("needs.%s.outputs.secret_verification_result", constants.ActivationJobName)), BuildStringLiteral("failed"))
 		activationGuardrailsFailed = BuildOr(activationGuardrailsFailed, secretVerificationFailed)
 	}
-	if isDockerSbxRuntime(data) {
-		dockerSbxSecretsFailed := BuildEquals(BuildPropertyAccess(fmt.Sprintf("needs.%s.outputs.docker_sbx_secrets_result", constants.ActivationJobName)), BuildStringLiteral("failed"))
-		activationGuardrailsFailed = BuildOr(activationGuardrailsFailed, dockerSbxSecretsFailed)
-	}
 	if hasMaxDailyAICGuardrail(data) {
 		dailyAICExceeded := BuildEquals(BuildPropertyAccess(fmt.Sprintf("needs.%s.outputs.daily_ai_credits_exceeded", constants.ActivationJobName)), BuildStringLiteral("true"))
 		dailyAICStatus := BuildPropertyAccess(fmt.Sprintf("needs.%s.outputs.daily_ai_credits_guardrail_status", constants.ActivationJobName))
@@ -600,7 +601,7 @@ func (c *Compiler) buildConclusionJobConcurrency(data *WorkflowData) string {
 // Returns nil when report-failed-jobs is explicitly set to false.
 func (c *Compiler) buildConclusionReportFailedJobsStep(data *WorkflowData, mainJobName string) []string {
 	// Skip when explicitly disabled via frontmatter
-	if data.SafeOutputs != nil && data.SafeOutputs.ReportFailedJobs != nil && !*data.SafeOutputs.ReportFailedJobs {
+	if data.SafeOutputs != nil && data.SafeOutputs.ReportFailedJobs != nil && strings.EqualFold(strings.TrimSpace(data.SafeOutputs.ReportFailedJobs.String()), "false") {
 		notifyCommentLog.Print("Skipping report-failed-jobs step: disabled in frontmatter")
 		return nil
 	}
@@ -608,7 +609,7 @@ func (c *Compiler) buildConclusionReportFailedJobsStep(data *WorkflowData, mainJ
 	envVars = append(envVars, buildWorkflowMetadataEnvVarsWithTrackerID(data.Name, data.Source, data.TrackerID, buildLocalWorkflowSourceURL(c.markdownPath))...)
 	envVars = append(envVars, "          GH_AW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\n")
 	if data.SafeOutputs != nil && data.SafeOutputs.ReportFailedJobs != nil {
-		envVars = append(envVars, fmt.Sprintf("          GH_AW_REPORT_FAILED_JOBS: %q\n", strconv.FormatBool(*data.SafeOutputs.ReportFailedJobs)))
+		envVars = append(envVars, buildTemplatableBoolEnvVar("GH_AW_REPORT_FAILED_JOBS", templatableBoolPtrToStringPtr(data.SafeOutputs.ReportFailedJobs))...)
 	} else {
 		envVars = append(envVars, "          GH_AW_REPORT_FAILED_JOBS: \"true\"\n")
 	}

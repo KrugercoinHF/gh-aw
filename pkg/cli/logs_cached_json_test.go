@@ -117,7 +117,7 @@ func TestCachedLogsJSONLWriterIncludesSafeDashboardEvidence(t *testing.T) {
 		"cli_version": "0.99.0",
 		"awf_version": "0.20.0",
 		"awmg_version": "0.30.0",
-		"agent_runtime": "gvisor"
+		"agent_runtime": "cloud-hypervisor"
 	}`), 0o600))
 	path := filepath.Join(t.TempDir(), "logs.jsonl")
 	writer := newCachedLogsJSONLWriter(path)
@@ -173,7 +173,7 @@ func TestCachedLogsJSONLWriterIncludesSafeDashboardEvidence(t *testing.T) {
 	assert.Equal(t, "1.2.3", record.Run.EngineVersion)
 	assert.Equal(t, "gpt-5", record.Run.Model)
 	assert.Equal(t, "0.99.0", record.Run.GhAwVersion)
-	assert.Equal(t, "gvisor", record.Run.AgentRuntime)
+	assert.Equal(t, "cloud-hypervisor", record.Run.AgentRuntime)
 	assert.Equal(t, "0.20.0", record.Run.FirewallVersion)
 	assert.Equal(t, "0.30.0", record.Run.GatewayVersion)
 	require.Len(t, record.Run.JobDetails, 1)
@@ -605,6 +605,28 @@ func TestCachedLogsJSONLExistingRecordAvoidsDuplicateWork(t *testing.T) {
 	assert.Equal(t, before, after)
 }
 
+func TestCachedLogsCollectorDoesNotRewriteCachedRun(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "logs.jsonl")
+	writer := newCachedLogsJSONLWriter(path)
+	cached := RunData{RunID: 42}
+	collector := &orderedLogsRunCollector{
+		candidates: []ProcessedRun{
+			{Run: WorkflowRun{DatabaseID: 41}},
+			{Run: WorkflowRun{DatabaseID: 42}, cachedData: &cached},
+		},
+		accepted: []bool{true, true},
+	}
+
+	processedRuns, batchProcessed := collector.appendAccepted(nil, 0, writer)
+
+	require.Len(t, processedRuns, 2)
+	assert.Equal(t, 2, batchProcessed)
+	cache, err := loadCachedLogsJSONL(path)
+	require.NoError(t, err)
+	require.Contains(t, cache.runs, int64(41))
+	assert.NotContains(t, cache.runs, int64(42))
+}
+
 func TestCachedLogsJSONLWriterSerializesConcurrentAppends(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "logs.jsonl")
 	writer := newCachedLogsJSONLWriter(path)
@@ -637,7 +659,7 @@ func TestCachedLogsLookupHonorsRepositoryAndFilters(t *testing.T) {
 	assert.True(t, ok)
 	_, ok = runs.lookup(run, runFilterOpts{engine: "claude"})
 	assert.False(t, ok)
-	_, ok = runs.lookup(run, runFilterOpts{runtime: "gvisor"})
+	_, ok = runs.lookup(run, runFilterOpts{runtime: "cloud-hypervisor"})
 	assert.False(t, ok)
 	_, ok = runs.lookup(WorkflowRun{DatabaseID: 42, Repository: "other/repo", Status: "completed", Conclusion: "success", Attempt: 1, UpdatedAt: updatedAt}, runFilterOpts{})
 	assert.False(t, ok)
